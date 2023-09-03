@@ -1,0 +1,970 @@
+---
+title: "PARTY AND DATE HUBS IN PROTEIN-PROTEIN INTERACTION NETWORKS"
+author:
+- name: Eleonora Cianini 
+  affiliation: University of Milan and Politecnico of Milan
+  email: eleonora.cianini@studenti.unimi.it - eleonora.cianini@mail.polimi.it
+output: rmdformats::robobook
+---
+
+```{r setup, include=FALSE}
+library(knitr)
+#library(rmdformats)
+knitr::opts_chunk$set(echo = TRUE, results = TRUE, warning = FALSE, message = FALSE)
+options(knitr.duplicate.label = "allow")
+```
+
+
+# Introduction
+
+Protein-protein interaction networks are the key representative of biological networks since they contain all the possible protein connections of an organism.
+
+A network is a graph made of a certain number of nodes _linked_ by edges and characterized by different topological properties.
+Among them, in this project we will focus on:
+
+- **Degree**: number of associated links to each single node. This property allows us to identify **hubs** as nodes with high degree (i.e. node that interacts with many other hubs) and they can be further classified in:    
+  - **Party hub** that interact with many partners at the same time.
+  
+  - **Date hub** that have many targets, but interact with only few of them at any moment.
+
+- **Shortest path betweenness centrality**: measures the number of shortest paths going through a certain node. It measures the centrality, how much information pass through a node and therefore, proteins with the highest betweenness are critical points for the network and are called **bottlenecks**.
+
+Joining the effects of betweenness and degree is possible to divide all the proteins of a specific network into four categories: bottleneck hubs **(BH)**, non-bottleneck hubs **(NBH)**, bottleneck non-hubs **(BNH)** and non-bottleneck non-hubs **(NBNH)**.
+
+
+```{r , echo=FALSE, fig.cap="Cateogories and hub types", out.width = '80%', fig.show='hold'}
+knitr::include_graphics("/Users/IEO6194/Desktop/categories.jpg")
+knitr::include_graphics("/Users/IEO6194/Desktop/party_date.png")
+```
+
+The aim of this project is to integrate the **four categories** - BH, NBH, BNH and NBNH - defined on the basis of the topological properties of degree and betweenness, with **party and date hubs** concept using an _E.Coli_ interactome and gene expression compendium. 
+
+# 1. Data collection
+
+```{r load libraries }
+library(ggplot2)
+library(dplyr)
+library(igraph)
+library(RCy3)
+library(multimode)
+library(diptest)
+library(pheatmap)
+library(uwot)
+library(rgl)
+library(RColorBrewer)
+library(corrplot)
+```
+
+```{r set working directory}
+#setwd("~/Documents/AdvGen")
+```
+
+## 1.1 Protein-protein interaction network description and loading 
+
+The first dataset consist in an interaction network table available on
+[STRING](https://string-db.org/) in which each protein-protein interaction is annotated with different **confidence scores**.
+These scores should be interpreted as "indicators" reflecting the **probability** that the reported interaction is
+considered true given the existing evidences.
+So, for example, if the scores rank from 0 (lowest confidence) to 1 (highest confidence), a score of 0.5 would indicate that every second interaction might be a false positive.
+
+```{r}
+#load E.Coli protein-protein interaction network
+EcoPPI<-read.table("511145.protein.physical.links.full.v11.0.txt",header=TRUE)
+head(EcoPPI)
+```
+```{r}
+cat(paste("The number of protein-protein interactions is", nrow(EcoPPI), 
+      "and there are", ncol(EcoPPI)-2, "types of scores."))
+```
+
+From the table above, is possible to notice that in most cases there are **two types of scores**: **'normal'** and **'transferred'**.
+The difference between the two regards the fact that the latter is computed from data coming from other organism (and not the organism of interest) and then transferred via homology/orthology.
+
+## 1.2 Gene expression compendium description and loading
+The second dataset is the _E.coli_ gene expression compendium, built using RNA-seq libraries from SRA in an automatic fashion.
+
+```{r}
+#load E.coli gene expression compendium
+load("Ecoli_compendium.RData")
+```
+
+It contains three different versions of gene expression data:
+
+-   ALL_FINAL_Nreads.
+
+-   ALL_FINAL_TPM.
+
+-   ZL2.
+
+In all three cases, the rows of the matrices are genes (with the gene identifier) and the columns are the different conditions where gene expression is measured.
+
+For the subsequent analysis, among the three, the ZL2 is chosen and merged with the information contained in the protein-protein interaction network.
+
+```{r}
+Ecoli_comp <- as.data.frame(ZL2)
+#merging PPI and ZL2 
+Ecoli_comp$protein <- row.names(Ecoli_comp)
+EcoPPI_GeneExpr <- merge(EcoPPI, Ecoli_comp, by.x="protein1", by.y="protein")
+```
+
+
+# 2. Data preparation 
+
+## 2.1 Confidence based filtering  
+As previously mentioned, in the PPI network, the presence of confidence scores makes possible to quantify the strength of the supporting evidence for each reported interaction.
+
+In order to increase the strength of evidence and to avoid taking into consideration false-positive interactions, we filter the PPI network by imposing a score threshold both to the <code>experiment score</code>  and the <code>transferred experiment score</code>.
+
+##  {.tabset .tabset-fade .tabset-pills}
+
+### 2.1.1 EXPERIMENT SCORE  { .unnumbered}
+
+In the PPI network, the <code>experiments column</code> has a range of values that goes from 0 to 896 and indicates a sort of "confidence" in the
+experiment: higher the value, higher the confidence.
+
+```{r}
+p0 <- ggplot(EcoPPI_GeneExpr, aes(x=experiments)) +
+  geom_histogram(fill ="#C0C0C0", bins= 30, colour='#696969') + 
+  labs(title="Experiment score value distribution",x="Values", y = "Frequency") + 
+  theme_light()
+
+p0 + theme(plot.title = element_text(face='bold'))
+```
+
+From the histogram is possible to notice that a big number of interactions have value equal to zero. 
+In particular:
+
+```{r}
+zero_int <- length(EcoPPI_GeneExpr$experiments[(which(EcoPPI_GeneExpr$experiments == 0))])
+zero_int_percentage <-trunc(zero_int/ nrow(EcoPPI_GeneExpr) *100)
+cat(paste("The number of interactions with experiment confidence equal to 0 are", zero_int, "which correspond to the", zero_int_percentage, "% of the total interactions."))
+```
+
+To increase the confidence, we eliminate these zero confidence interactions:
+
+```{r}
+zeroExp<-0
+EcoPPI_EXP <-as.data.frame(cbind(EcoPPI_GeneExpr$protein1[EcoPPI_GeneExpr$experiments>zeroExp],
+                                EcoPPI_GeneExpr$protein2[EcoPPI_GeneExpr$experiments>zeroExp],                
+                                EcoPPI_GeneExpr$experiments[EcoPPI_GeneExpr$experiments>zeroExp]))
+non_zero_int <- nrow(EcoPPI_EXP)
+cat(paste("The number of remaining protein-protein interactions is: ", non_zero_int))
+```
+
+```{r}
+#change column name
+colnames(EcoPPI_EXP) <- c("protein_1", "protein_2", "weight")
+
+#change the type of the class "weight"
+EcoPPI_EXP$weight <- as.numeric(EcoPPI_EXP$weight)
+```
+
+After removing the zero confidence interactions, we can plot again the distribution in order to decide an higher threshold for the confidence:
+
+```{r}
+p1 <- ggplot(EcoPPI_EXP, aes(x=weight)) +
+  geom_histogram(fill ="#C0C0C0", bins= 30, colour='#696969') +
+  geom_vline(xintercept = 100, color = 'red')+
+  labs(title="Experiment score value distribution",x="Values", y = "Frequency") + theme_light()
+
+p1 + theme(plot.title = element_text(face='bold'))
+```
+
+From this second distribution plot is possible to better estimate the distribution of the scores values: we can notice that only "few" interactions have a very high confidence (>750) while the most interactions have a medium (<400) confidence score. 
+
+For this reason, in order to avoid the loss of too much information, we decide to set the experiment confidence threshold equal to 100, right before the highest peak in the distribution.
+
+```{r}
+#create the new filtered df
+new_exp_threshold<-100
+EcoPPI_EXP_filtered <-as.data.frame(cbind(EcoPPI_EXP$protein_1[EcoPPI_EXP$weight>new_exp_threshold],
+                                         EcoPPI_EXP$protein_2[EcoPPI_EXP$weight>new_exp_threshold],                        
+                                         EcoPPI_EXP$weight[EcoPPI_EXP$weight>new_exp_threshold]))
+exp_int <- nrow(EcoPPI_EXP_filtered)
+cat(paste("The number of protein-protein interactions is: ", exp_int))
+```
+
+
+### 2.1.2 TRANSFERRED EXPERIMENT SCORE  { .unnumbered}
+
+In the PPI network, the <code>transferred experiments column</code> has a range of values that goes from 0 to 999 and indicates a sort of "confidence" in the
+experiment: higher the value, higher the confidence.
+
+We can proceed as in the <code>experiments</code> scores and plot the distribution:
+
+```{r}
+p2 <- ggplot(EcoPPI_GeneExpr, aes(x=experiments_transferred)) +
+  geom_histogram(fill ="#C0C0C0", bins= 30, colour='#696969') + 
+  labs(title="Experiment transferred score value distribution",x="Values", y = "Frequency") + 
+  theme_light()
+
+p2 + theme(plot.title = element_text(face='bold'))
+
+```
+Also in that case, from the histogram is possible to notice that a big number of interactions have a value equal to zero. 
+In particular:
+
+```{r}
+zero_int_transf <- length(EcoPPI_GeneExpr$experiments_transferred[(which(EcoPPI_GeneExpr$experiments_transferred == 0))])
+zero_int_transf_percentage <-trunc(zero_int/ nrow(EcoPPI_GeneExpr) *100)
+cat(paste("The number of interactions with experiment transferred confidence equal to 0 are", zero_int_transf, "which correspond to the", zero_int_transf_percentage, "% of the total interactions."))
+```
+
+To increase the confidence, we eliminate these zero confidence interactions:
+
+```{r}
+zeroExpTrans<-0
+EcoPPI_EXP_TRANS <-as.data.frame(cbind(EcoPPI_GeneExpr$protein1[EcoPPI_GeneExpr$experiments_transferred>zeroExpTrans],
+                                EcoPPI_GeneExpr$protein2[EcoPPI_GeneExpr$experiments_transferred>zeroExpTrans],                
+                                EcoPPI_GeneExpr$experiments_transferred[EcoPPI_GeneExpr$experiments_transferred>zeroExpTrans]))
+non_zero_int_trans <- nrow(EcoPPI_EXP_TRANS)
+cat(paste("The number of remaining protein-protein interactions is: ", non_zero_int))
+```
+
+```{r}
+colnames(EcoPPI_EXP_TRANS) <- c("protein_1", "protein_2", "weight")
+
+#change the type of the class "weight"
+EcoPPI_EXP_TRANS$weight <- as.numeric(EcoPPI_EXP_TRANS$weight)
+```
+
+After removing the zero confidence interaction, we can plot again the distribution in order to decide an higher threshold for the confidence:
+
+```{r}
+p3 <- ggplot(EcoPPI_EXP_TRANS, aes(x=weight)) +
+  geom_histogram(fill ="#C0C0C0", bins= 30, colour='#696969') +
+  geom_vline(xintercept = 80, color = 'red')+
+  labs(title="Experiment transferred score value distribution",x="Values", y = "Frequency") + theme_light()
+
+p3 + theme(plot.title = element_text(face='bold'))
+```
+
+From this second distribution plot is possible to better estimate the distribution of the scores values: we can notice that only "few" interactions have a very high confidence (>780) while the most interactions have a medium-low (<300) confidence score. 
+
+For this reason, in order to avoid the loss of too much information, we decide to set the experiment confidence threshold equal to 80, right before the highest peak in the distribution.
+
+```{r}
+#create the new filtered df
+new_exp_trans_threshold<-80
+EcoPPI_EXP_TRANS_filtered <-as.data.frame(cbind(EcoPPI_EXP_TRANS$protein_1[EcoPPI_EXP_TRANS$weight>new_exp_trans_threshold],
+                                         EcoPPI_EXP_TRANS$protein_2[EcoPPI_EXP_TRANS$weight>new_exp_trans_threshold],                        
+                                         EcoPPI_EXP_TRANS$weight[EcoPPI_EXP_TRANS$weight>new_exp_trans_threshold]))
+exp_trans_int <- nrow(EcoPPI_EXP_TRANS_filtered)
+cat(paste("The number of protein-protein interactions is: ", exp_trans_int))
+```
+
+## Network selection 
+The <code>experiment_transferred</code> network is bigger and more connected (112328 interactions) with respect to the <code>experiment</code> one (4649 interactions).
+
+Taking into account the computational cost, the confidence value distribution and the nature of the interactions, for the subsequent analysis we will focus on the network containing the **experimentally verified interactions** only.
+
+## 2.3 Graph generation 
+
+After the filtering confidence procedure, it is possible to transform the network into a **graph**, which is an abstract object which describes a biological network with nodes and edges.
+
+```{r}
+#graph creation
+graph_eco_exp <-graph.data.frame(EcoPPI_EXP_filtered)
+
+#extract connected components
+connected_components <-components(graph_eco_exp)
+cat(paste("The number of connected components is: ", length(unique(connected_components$membership))))
+```
+
+We can have a visual inspection of the graph by using:
+
+-   <code>iGraph plot</code> built-in function;
+
+-   <code>Cytoscape</code>
+
+In both the two visualizations it is possible to notice the presence of a large number of interaction aggregated in the center of the graph.
+
+##  {.tabset .tabset-fade .tabset-pills}
+
+### IGRAPH visualization { .unnumbered}
+```{r}
+#we firstly simplify the graph in order to improve the readability
+
+s <- simplify(graph_eco_exp,remove.multiple = F, remove.loops = T)
+
+plot(s, edge.arrow.size=.1, edge.curved=0,
+     vertex.color="#009999", vertex.frame.color="#2F4F4F",
+     vertex.label.cex=.1) 
+```
+
+
+### CYTOSCAPE visualization { .unnumbered}
+Another way to visualize network's structure is by using [Cytoscape](https://cytoscape.org/), an open-source software platform for network analysis and visualization.
+It is a stand alone software but through the R Bioconductor package <code>RCy3</code> is possible to have access to its full feature set from within the R programming environment. 
+In order to do that, firstly we have to install RCy3 and then load, install and run Cytoscape too.
+
+```{r, echo=TRUE}
+#run cytoscape in order to ping it
+cytoscapePing()
+```
+Then we can import our graph directly on Cytoscape: 
+
+```{r}
+createNetworkFromIgraph(graph_eco_exp, new.title="Interaction E.Coli graph")
+```
+From Cytoscape we can better appreciate the structure of the network because we can "navigate" through it instead of having a static visualization as in the case of the <code>iGraph</code> plot.
+
+```{r pressure, echo=FALSE, fig.cap="Cytoscape visualization of the network", out.width = '100%'}
+knitr::include_graphics("/Users/IEO6194/Desktop/graph.png")
+```
+We can zoom-in the agglomerate portion to improve the interactions visualization:
+
+```{r , echo=FALSE, fig.cap="Zoomed version of the network", out.width = '100%'}
+knitr::include_graphics("/Users/IEO6194/Desktop/zoomedgraph.png")
+```
+
+## 2.4 Degree distribution
+
+As mentioned above, a graph is made of two main elements, edges (links) and nodes, which can be used to analytically describe a network.
+In particular, we can define the **degree** of a node as the number of associated links to each single node and, starting from it we can calculate the **degree distribution** as the probability that a node has exactly _k_ link.
+It is displayed as a density probability and the **shape** of the curves gives information about the **TYPE** of the network.
+
+Based on the shape of the degree distribution we can define:
+
+-   **RANDOM NETWORK** in which each pair of nodes is connected with equal probability following a normal distribution (bell shaped).
+
+-   **SCALE FREE NETWORK** in which most of the nodes have few links (small probability) and only a small portion of nodes is connected to many other nodes (high probability).
+In that case we talk about power-law distribution. 
+
+```{r , echo=FALSE, fig.cap="Types of degree distribution", out.width = '50%'}
+knitr::include_graphics("/Users/IEO6194/Desktop/Degree_distribution.png")
+```
+
+Most biological networks are scale-free, since they have only few important nodes connected to many other nodes (hubs) whereas the vast majority display few connections.
+
+We can plot the degree distribution of our network and,  since we are dealing with biological data, we expect that we will find a scale-free one.
+
+```{r}
+degree_distr <- degree_distribution(graph_eco_exp, cumulative=T, mode="all")
+plot(x=0:max(degree(graph_eco_exp)), y=degree_distr, pch=19, cex=1.2, col="#ADD8E6",
+xlab="Degree (K)", ylab="Probability P(K)",
+main = "Degree distribution")
+```
+
+Summarizing the findings we can say that the network's **degree distribution** follows the **power-law** that characterizes scale-free networks and:  
+
+```{r}
+cat(paste("The network contains",vcount(graph_eco_exp),"proteins and", ecount(graph_eco_exp),"interactions."))
+```
+
+
+# 3. Nodes classification (BH, NBH, BNH, NBNH)
+
+In this section we aim to classify the nodes of the network into bottleneck hubs, non-bottleneck hubs, bottleneck non-hubs and non-bottleneck-non-hubs which is the largest group by definition.
+
+## Hubs definition
+As did by [Haiyan et al.](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC1853125/) first of all we identify **hubs** as all the proteins that have the 20% highest number of neighbors. 
+
+```{r}
+#Identify hubs as proteins with 20% of the total connections
+deg <-igraph::degree(graph_eco_exp)
+
+deg_tau<-quantile(deg,0.9)
+```
+
+We can have a visual inspection of the number of proteins classified as hubs and non hubs
+
+```{r}
+h <- V(graph_eco_exp)$name[deg >= deg_tau]
+nh <- V(graph_eco_exp)$name[deg < deg_tau]
+
+h_nh <- data.frame('classification' = c('hubs', 'non_hubs'),
+                'number' = c(length(h), length(nh)))
+
+p4 <- ggplot(h_nh, aes(classification, number, fill = classification)) +
+  geom_bar(position = 'dodge', stat = 'identity') +
+  geom_text(aes(x = classification, label = number),position = position_dodge(width = 0.9), vjust =-0.1 , size = 3, col = 'black') +
+  scale_fill_manual(values = c("#DDA0DD","#FFF8DC"),
+                    name = 'Classification',
+                    labels = c('Hubs','Non hubs'))+
+  labs(title="Hubs non-hubs classification",x="Type", y = "Frequency")+
+  scale_x_discrete(label = c('Hubs', 'Non hubs'))+
+  theme_light()
+
+
+p4 + theme(plot.title = element_text(face='bold'))
+```
+As expected, the vast majority of the proteins are classified as non-hubs.
+
+## Betweenness definition
+We can then define **betweenness** as the proteins that are in the top 20% in terms of betweenness centrality. 
+
+```{r}
+bet<-betweenness(graph_eco_exp,directed=FALSE)
+#filter based on the quantile threshold
+bet_tau<-quantile(bet,0.9)
+```
+
+## Identification of the four categories of nodes in a network 
+
+Using the degree and the betweenness as thresholds, we can identify all the nodes categories we are interested in.
+```{r}
+## Select the bottleneck-hubs (BH) 
+BH <-V(graph_eco_exp)$name[bet>=bet_tau & deg>=deg_tau]
+
+## Select the on-bottleneck hubs (NBH)
+NBH <-V(graph_eco_exp)$name[bet<bet_tau & deg>=deg_tau]
+
+## Select the non-hub (BNH)
+BNH <-V(graph_eco_exp)$name[bet>=bet_tau & deg<deg_tau]
+
+## Select the Non bottleneck non hubs (NBNH)
+NBNH <-V(graph_eco_exp)$name[bet<bet_tau & deg<deg_tau]
+
+cat("We obtained:\n",
+    length(BH), "Bottleneck-hubs (BH)\n",
+    length(NBH), "Non bottleneck-hubs (NBH)\n",
+    length(BNH), "Bottleneck-Non hubs (BNH)\n",
+    length(NBNH), "Non bottleneck-Non hubs (NBNH)")
+```
+
+Also in this case we can plot the result of the classification.
+
+```{r}
+final_class <- data.frame('classification' = c('Bottleneck hubs', 'Non-bottleneck hubs', 'Bottleneck non-hubs', 'Non-bottleneck non-hubs'), 'number' = c(length(BH), length(NBH), length(BNH), length(NBNH)))
+
+p5 <- ggplot(final_class, aes(classification, number, fill = classification)) +
+  geom_bar(position = 'dodge', stat = 'identity') +
+  geom_text(aes(x = classification, label = number),
+            position = position_dodge(width = 0.9), 
+            vjust = -0.1, size = 3, col = 'black') +
+  scale_fill_manual(values = c("#D8BFD8", "#B0E0E6", "#008080", "#F5F5F5"),
+                    name = 'Classification')+
+  labs(title="Nodes classification",x="Type", y = "Frequency")+
+  scale_x_discrete(label = c('BH','NBH','BNH','NBNH'))+
+  theme_light()
+
+p5 + theme(plot.title = element_text(face='bold'))
+
+```
+As confirmation we can observe that "non-bottleneck-non hubs" is the largest category.
+
+# 4. Party and date hubs integration 
+
+This project aims to integrate the bottleneck hubs and the non-bottleneck hubs categories with the idea of **party and date hubs** using the information contained in the <code>ZL2</code> dataset coming from the _E.Coli_ gene expression compendium.
+
+In order to do that, we calculate the **correlation among the interactors only**, an approach slightly different from the one used in literature, which is based on the correlation of the hub under analysis and its neighbor in the network.
+This difference is due to the fact that in a gene expression compendium a hub might be expressed in a handful of neighbors (not all) and so we end up calculating the correlation hub-interactors, for a potentially reduced number of meaningful samples (those for which the hub under analysis and the interactors are expressed).
+Also constitutive hub might be a problem because on one hand, with a little variation of gene expression the correlation calculation is not very meaningful/possible (when the expression is truly constant) and, on the other hand they might interact with different targets at different times (date hub) or have targets that are all expressed at the same time (party hub).
+
+Focusing on the correlation among neighbors allows to partially overcome these problems.
+
+
+Before starting the actual Pearson correlation calculation for the BH and NBH, we define: 
+
+```{r}
+#range of pearson correlation coefficient
+fixed_intervals<-seq(-1.05,1.05,.1)
+```
+
+## 4.1 Pearson Correlation Coefficient calculation 
+
+To calculate the correlation coefficient (PCC) distribution for all the interactors we **iterate** over a loop in order to obtain a **correlation matrix** of all the proteins interacting with BH[n]/NBH[n] vs themselves in all combinations.
+We store the distribution of Pearson for each member of each category and then we put all the pearson values together by plotting an histogram.
+In order to avoid to give more "weight" to hubs with a larger number of interactors we take care to specify the breaks equal to the fixed intervals set above.
+As a last step we store the counts and the middle point of each interval, obtaining a matrix populated by the values of all members of the group.
+
+##  {.tabset .tabset-fade .tabset-pills}
+
+### BH correlation coefficient { .unnumbered}
+We compute the Pearson correlation coefficient for bottleneck hubs: 
+
+```{r}
+#matrix 
+allpearsonsBH <- matrix(0,ncol=length(fixed_intervals)-1,nrow=length(BH))
+
+for(n in 1:length(BH)){
+  #hub interactors list 
+  hub_interactors <- neighborhood(graph_eco_exp,nodes=BH[n])[[1]]
+  
+  #corresponding rows from gene expression compendium
+  extracted_rows <- ZL2[match(names(hub_interactors),rownames(ZL2)),]
+  
+  #correlation when BH[n] is expressed
+  BHn_expressed <- which(extracted_rows[1,] > mean(extracted_rows[1,]))
+  extracted_rows <- extracted_rows[,BHn_expressed]
+  
+  #remove BH[n] from the evaluation
+  extracted_rows<-extracted_rows[-1,]
+
+  #calculate correlation matrix of all the proteins interacting with BH[n] vs themselves in all combinations
+  pearsons <- cor(t(extracted_rows))
+  
+  #transform the matrix into a vector
+  pearsons<-pearsons[upper.tri(pearsons)]
+  
+  #to avoid that hubs with larger number of interactors will get more weight we can do the follow
+  #for an easy visualization we plot only the first 5 histogram
+  if(n >=1 && n <= 5){
+  h <- hist(pearsons, breaks = fixed_intervals)
+  }
+  else
+    h <- hist(pearsons, breaks = fixed_intervals, plot = FALSE)
+  #store the occurence
+  allpearsonsBH[n,]<-h$counts/sum(h$counts)
+}
+```
+From the plots we can observe slighlty different pearson distributions of the hubs under analysis: sometimes the peak is centered to zero, other times is right before or after.
+_(N.B. For simplicity only few plots are printed)_
+
+```{r}
+colnames(allpearsonsBH)<-h$mids
+rownames(allpearsonsBH)<-BH
+```
+
+Since in allpearsonBH we stored all the relative occurrences of the pearson coefficients, we can plot them in order to better estimate the distribution.
+
+```{r}
+#create pearsonBH dataframe
+pearsonBH <- data.frame('Frequency' = as.numeric(colnames(allpearsonsBH)),
+                               'Pearsons' = colMeans(allpearsonsBH))
+
+p6 <- ggplot(pearsonBH, aes(x = Frequency, y = Pearsons, group=1)) +
+  geom_line(color ="#D8BFD8")+
+  geom_point(color ="#D8BFD8", shape = 4) +
+  labs(title="Bottleneck hubs correlation plot",x="Pearson correlation coefficient", y = "Frequency")+
+  theme_light()
+
+p6 + theme(plot.title = element_text(face='bold'))
+```
+
+From a visual inspection, the PCC distribution for bottleneck hubs has a peak between 0 and 0.25 and a second, less marked peak in 0.5.
+
+### NBH correlation coefficient { .unnumbered}
+
+We compute the Pearson correlation coefficient for non-bottleneck hubs:
+```{r}
+#matrix 
+allpearsonsNBH <- matrix(0,ncol=length(fixed_intervals)-1,nrow=length(NBH))
+
+for(n in 1:length(NBH)){
+  #hub interactors list 
+  hub_interactors <- neighborhood(graph_eco_exp,nodes=NBH[n])[[1]]
+  
+  #corresponding rows from gene expression compendium
+  extracted_rows <- ZL2[match(names(hub_interactors),rownames(ZL2)),]
+  
+  #correlation when NBH[n] is expressed
+  NBHn_expressed <- which(extracted_rows[1,] > mean(extracted_rows[1,]))
+  extracted_rows <- extracted_rows[,NBHn_expressed]
+  
+  #remove NBH[n] from the evaluation
+  extracted_rows<-extracted_rows[-1,]
+
+  #calculate correlation matrix of all the proteins interacting with NBH[n] vs themselves in all combinations
+  pearsons <- cor(t(extracted_rows))
+  
+  #transform the matrix into a vector
+  pearsons<-pearsons[upper.tri(pearsons)]
+  
+  #to avoid that hubs with larger number of interactors will get more weight we can do the follow
+  #for an easy visualization we plot only the first 5 histogram
+  if(n >=1 && n <= 5){
+  h <- hist(pearsons, breaks = fixed_intervals)
+  }
+  else
+    h <- hist(pearsons, breaks = fixed_intervals, plot = FALSE)
+  #store the occurence
+  allpearsonsNBH[n,]<-h$counts/sum(h$counts)
+}
+
+```
+From the plots we can observe slightly different pearson distributions of the hubs under analysis: sometimes the peak is centered in 0.5, other times is right before or after and other times we can notice the presence of two peaks instead of one.
+_(N.B. For simplicity only few plots are printed)_
+
+```{r}
+colnames(allpearsonsNBH)<-h$mids
+rownames(allpearsonsNBH)<-NBH
+```
+
+Since in allpearsonNBH we stored all the relative occurrences of the pearson coefficients, we can plot them in order to better estimate the distribution.
+
+```{r}
+#create pearsonNBH dataframe
+pearsonNBH <- data.frame('Frequency' = as.numeric(colnames(allpearsonsNBH)),
+                               'Pearsons' = colMeans(allpearsonsNBH))
+
+p7 <- ggplot(pearsonNBH, aes(x = Frequency, y = Pearsons, group=1)) +
+  geom_line(color ="#B0E0E6")+
+  geom_point(color ="#B0E0E6", shape = 18) +
+  labs(title="Non-bottleneck hubs correlation plot",x="Pearson correlation coefficient", y = "Frequency")+
+  theme_light()
+
+p7 + theme(plot.title = element_text(face='bold'))
+```
+
+From a visual inspection, the PCC distribution for non-bottleneck hubs has a peak in between 0 and 0.25 and a subsequent peak between 0.3 and 0.5.
+
+## 4.2 PCCs comparison
+
+We are interested in the PCC distribution for both types of hubs because in their work, from which this analysis takes inspiration, [Han et al.](https://www.nature.com/articles/nature02555) found out that the **average PCCs of hubs** follow clearly a **bimodal distribution** in the compendium of yeast.
+
+When we talk about bimodal distribution we refer to a distribution with two peaks, or two local maximus, that are points in which data points stop increasing and start decreasing.
+
+The presence of two peaks in data indicates the existence of two different groups, that, in the paper mentioned above, are identified as two distinct population of party and date hubs.
+
+Between the two distribution above, the NBH seems to follow a bimodal distribution but alone the visual inspection is not sufficient to establish the bimodality and so we perform a statistical test on both the distribution in order to determine it.
+
+In particular we use the **Hartigans' dip test** available in the <code>multimode</code> [Rpackage](https://cran.r-project.org/web/packages/multimode/multimode.pdf), which tests the number of modes in a given distribution.
+In this test for Xi ∼ F, i.i.d., the null hypothesis is that F is a unimodal distribution (i.e. mod0 = 1), and the test alternative is non-unimodal at least bimodal.
+
+```{r}
+#dip test for BH
+modetest(pearsonBH$Pearsons, mod0 = 1, method = "HH")
+```
+Since the test p-value is almost equal to ~1 we have no evidence to accept the alternative hypothesis of multimodality, so the BH distribution is unimodal.
+
+We perform the test also for the NBH: 
+```{r}
+modetest(pearsonNBH$Pearsons, mod0 = 1, method = "HH")
+```
+In that case the p-value is lower than before but since it is almost equal to ~0.4, also in that case we have no evidence to reject the null hypothesis and we can state that the distribution is unimodal.
+
+
+## 4.3 Party and Date hubs classification
+
+Even if our results are in contrast with literature findings, we can still assume the presence of party and date hubs in both bottleneck and non-bottleneck distributions. 
+
+In particular, following the same approach used by Han et al., we can classify as party hubs those with relatively high average PCC and date hubs with low PCC. 
+
+In our case, since there is no bimodal distribution suggesting us a natural boundary for partitioning date hubs from party hubs, by looking at the two distributions above, we can _visually_ establish a boundary in correspondence of **PCC = 0.2** to divide each of the two categories of hubs in:
+
+-   date hubs if they have PCC < 0.2 
+
+-   party hubs if they have PCC >= 0.2
+
+Using this threshold we expect that the majority of BH will be classified as date hubs, while in NBH we expect a more balanced situation due to the fact that the distribution is slightly different.
+
+To proceed with the classification we can calculate the number of interactors classified as party or date hub in accordance with the chosen PCC threshold.
+
+##  {.tabset .tabset-fade .tabset-pills}
+
+### BH composition { .unnumbered}
+
+For the BH classification we can re-use part of the previous code applying the PCC threshold filter:
+
+```{r}
+BH_2 <- as.data.frame(matrix(0, ncol = 2, nrow = length(BH)))
+
+for(n in 1:length(BH)){
+  #hub interactors list 
+  hub_interactors <- neighborhood(graph_eco_exp,nodes=BH[n])[[1]]
+  
+  #corresponding rows from gene expression compendium
+  extracted_rows <- ZL2[match(names(hub_interactors),rownames(ZL2)),]
+  
+  #correlation when BH[n] is expressed
+  BHn_expressed <- which(extracted_rows[1,] > mean(extracted_rows[1,]))
+  extracted_rows <- extracted_rows[,BHn_expressed]
+  
+  #remove BH[n] from the evaluation
+  extracted_rows<-extracted_rows[-1,]
+
+  #calculate correlation matrix of all the proteins interacting with BH[n] vs themselves in all combinations
+  pearsons <- cor(t(extracted_rows))
+  
+  #transform the matrix into a vector
+  pearsons<-pearsons[upper.tri(pearsons)]
+  
+  #threshold selection
+  BH_2[n,] <- cbind(length(which(pearsons >= 0.2)),
+                   length(which(pearsons < 0.2)))
+}
+
+rownames(BH_2) <- BH
+colnames(BH_2) <- c('above_03','below_03')
+```
+
+Assign the class on the basis of the PCC threshold:
+
+```{r}
+#BH party and date classification
+BH_2$hub <- ifelse(BH_2$above_03 > BH_2$below_03, 'party', 'date')
+BH_2$tot <- BH_2$above_03 + BH_2$below_03
+```
+
+```{r}
+cat(paste("In bottleck hubs the date hubs are", length(which(BH_2$hub == "date")), 
+      "whereas the party hubs are", length(which(BH_2$hub == "party"))),".")
+```
+
+### NBH composition { .unnumbered}
+
+Also for the NBH classification we can re-use part of the previous code applying the PCC threshold filter:
+
+```{r}
+NBH_2 <- as.data.frame(matrix(0, ncol = 2, nrow = length(NBH)))
+
+for(n in 1:length(NBH)){
+  #hub interactors list 
+  hub_interactors <- neighborhood(graph_eco_exp,nodes=NBH[n])[[1]]
+  
+  #corresponding rows from gene expression compendium
+  extracted_rows <- ZL2[match(names(hub_interactors),rownames(ZL2)),]
+  
+  #correlation when NBH[n] is expressed
+  NBHn_expressed <- which(extracted_rows[1,] > mean(extracted_rows[1,]))
+  extracted_rows <- extracted_rows[,NBHn_expressed]
+  
+  #remove NBH[n] from the evaluation
+  extracted_rows<-extracted_rows[-1,]
+
+  #calculate correlation matrix of all the proteins interacting with NBH[n] vs themselves in all combinations
+  pearsons <- cor(t(extracted_rows))
+  
+  #transform the matrix into a vector
+  pearsons<-pearsons[upper.tri(pearsons)]
+  
+  #threshold selection
+  NBH_2[n,] <- cbind(length(which(pearsons >= 0.2)),
+                   length(which(pearsons < 0.2)))
+}
+
+rownames(NBH_2) <- NBH
+colnames(NBH_2) <- c('above_03','below_03')
+```
+
+Assign the class on the basis of the PCC threshold:
+
+```{r}
+#NBH party and date classification
+NBH_2$hub <- ifelse(NBH_2$above_03 > NBH_2$below_03, 'party', 'date')
+NBH_2$tot <- NBH_2$above_03 + NBH_2$below_03
+```
+
+```{r}
+cat(paste("In bottleck hubs the number of date hubs are", length(which(NBH_2$hub == "date")), 
+      "whereas the number of party hubs are", length(which(NBH_2$hub == "party"))),".")
+```
+
+
+## 4.4 Hubs composition comparison between BH and NBH
+
+From the classification we notice, as expected, that for BH the vast majority of the hubs are **date hubs**, whereas in the case of NBH we have a more balanced situation and an higher number of **party hubs**.
+
+In interaction network, protein bottleneck connect different functional clusters and so it is likely that bottleneck hubs have an higher tendency to be date hubs rather than party hubs.
+(https://bmcbioinformatics.biomedcentral.com/articles/10.1186/1471-2105-6-39) 
+
+We can further explore the relationship between party and date hubs with bottleneck and non-bottleneck hubs, with the aim of discover more about the relationship between them.
+
+```{r}
+#extract bottleneck hubs
+BH_2_hub <- as.data.frame(table(BH_2$hub))
+BH_2_hub$category <- 'Bottleneck'
+
+#extract non-bottleneck hubs
+NBH_2_hub <- as.data.frame(table(NBH_2$hub))
+NBH_2_hub$category <- 'Non-bottleneck'
+
+#create the merged df with party and date annotation
+BH_NBH_DP <- rbind(BH_2_hub,NBH_2_hub)
+colnames(BH_NBH_DP) <- c('Hubs','n','Category')
+```
+
+Plot the frequency to have a better visualization: 
+
+```{r}
+p8 <- ggplot(BH_NBH_DP, aes(Category, n, fill = Hubs)) +
+  geom_bar(position="dodge", stat = 'identity') +
+  geom_text(aes(x = Category, label = n),
+            position = position_dodge(width = 0.9), 
+            vjust = -0.2, size = 3, col = 'black') +
+  scale_fill_manual(values = c("#F08080", "#66CDAA"), name = 'Type of hubs') +
+  labs(title="Party and date hubs in BH and NBH",x="Category", y = "Frequency")+
+  theme_light()
+
+p8 + theme(plot.title = element_text(face='bold'))
+```
+From this plot seems that the distribution of the date and party hubs in the two category is slightly different, in particular for what regards date hubs in BH.
+
+In order to asses if there is a statistically significant difference on what we are observing, we build a contingency table to be used in the calculation of a [**chi-squared test**](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC5426219/), which is commonly used to compare the distribution of a categorical variable in a sample or a group with the distribution in another one. 
+
+```{r}
+#construct the contingency table
+contingency_table <- as.table(rbind(c(58,19), c(23, 29)))
+dimnames(contingency_table) <- list(Hubs = c("Date", "Party"),
+                    Categories = c("Bottleneck", "Non-bottleneck"))
+contingency_table
+```
+
+We can compute the chi-squared setting the null hypothesis as: no difference (relationship) exists between the categorical variables taken into consideration (in our case between the hub types and the BH/NBHs)
+
+```{r}
+print(chi_test <- chisq.test(contingency_table))
+```
+
+The p.value of the test is significant (<0.05) so we can reject the null hypothesis and say that there is a statistically significant relationship between the party/date hubs and the corresponding class to which they are associated.
+
+In particular, we can use the correlation plot of the residuals in order to better understand the associations:
+
+```{r}
+#correlation plot
+corrplot(chi_test$residuals, is.cor = FALSE, col = COL2("BrBG"))
+```
+In this plot positive residuals (in green) specify a positive associations between the row and the column variable, on the contrary in brown are shown negative residuals which are negative associations.
+
+From the image above, it's evident that there is a strong positive association between **party hubs** and the **non-bottleneck** category and, even if less marked, between **date hubs** and **bottleneck hubs**.
+
+# 5. Structure evaluation
+
+In order to see if there is some structure in the data, we can inspect them through the use of **heatmaps** if BH and NBH are similar for the way their targets are correlated. 
+
+## 5.1 Heatmaps
+
+###  {.tabset .tabset-fade .tabset-pills}
+
+#### BH heatmap { .unnumbered}
+
+Heatmap for bottleneck hubs:
+
+```{r}
+pheatmap(allpearsonsBH,
+         cluster_cols = FALSE, 
+         color = colorRampPalette(c("#FFFFFF", "#DDA0DD", "#800080"))(length(allpearsonsBH))
+)
+```
+
+From the heatmap it is not possible to notice the presence of a clear and specific structure in data; the distribution is "flat" for most of the interactors (low intensity) with the presence of few high correlated interactors centered around 0 and with a peak between 0.4 and 0.5. 
+
+This structure on one side may reflect the **higher presence of date hubs**, that communicate with different interactors at different times and, on the other, given the presence of some peaks, it can also reflect the mixed date-and-party composition.
+
+#### NBH heatmap { .unnumbered}
+
+Heatmap for non-bottleneck hubs:
+
+```{r}
+pheatmap(allpearsonsNBH,
+         cluster_cols = FALSE, 
+         color = colorRampPalette(c("#F5F5F5", "#5F9EA0", "#4682B4"))(length(allpearsonsNBH)))
+```
+
+From this second heatmap is possible to notice the presence of a slightly different structure in which there is an higher number higher correlated interactors, located in correspondence of PCC >= 0.
+
+This behavior can be related to the major presence of party hubs resulting in more coexpressed interactors at the same time. 
+
+## 5.2 UMAP and 3D-plot
+
+Additionally, we can further investigate if there is some inner structure by apply a dimensionality reduction technique (**UMAP**) and visualize the result with a 3D plot. 
+
+###  {.tabset .tabset-fade .tabset-pills}
+
+#### BH UMAP { .unnumbered}
+
+UMAP and 3D plot for BH:
+
+```{r}
+umap_BH <- umap(allpearsonsBH,n_components = 3)
+
+plot3d_BH <- plot3d(x=umap_BH[,1],y=umap_BH[,2],z=umap_BH[,3],
+                     type='s',radius=.1,
+                     col= "#DDA0DD",
+                     box = FALSE, 
+                     main= "3D-Bottleneck hubs plot", cex.main = 2,
+                     xlab= "1stComponent", ylab="2ndComponent", zlab= "3rdComponent")
+plot3d_BH
+rglwidget()
+```
+
+
+#### NBH UMAP { .unnumbered}
+
+UMAP and 3D plot for NBH:
+
+```{r}
+umap_NBH <- umap(allpearsonsNBH,n_components = 3)
+
+
+plot3d_nbh <- plot3d(x=umap_NBH[,1],y=umap_NBH[,2],z=umap_NBH[,3],
+                     type='s',radius=.1,
+                     col= "#5F9EA0",
+                     box = FALSE, 
+                     main= "3D-Non-bottleneck hubs plot", cex.main = 2,
+                     xlab= "1stComponent", ylab="2ndComponent", zlab= "3rdComponent")
+plot3d_nbh
+rglwidget()
+```
+
+
+### UMAP comparison 
+
+We can plot them togheter to eventually highlight the presence of clusters.
+
+```{r}
+#transform them into df and assign a color for the category
+allpearsonsBHdf <- as.data.frame (allpearsonsBH)
+allpearsonsBHdf$hub <- "#DDA0DD"
+allpearsonsNBHdf <- as.data.frame(allpearsonsNBH)
+allpearsonsNBHdf$hub <- "#5F9EA0"
+allPearsons <- rbind(allpearsonsBHdf,allpearsonsNBHdf)
+```
+
+```{r}
+umap_ALL <- umap(allPearsons,n_components = 3)
+
+plot3d_all <- plot3d(x=umap_ALL[,1],y=umap_ALL[,2],z=umap_ALL[,3],
+                     type='s',radius=.1,
+                     col= allPearsons$hub,
+                     box = FALSE, 
+                     main= "3D-Non-bottleneck hubs plot",
+                     xlab= "1stComponent", ylab="2ndComponent", zlab= "3rdComponent")
+legend3d("topright", legend = c("BH", "NBH"),
+      col =  c("#DDA0DD", "#5F9EA0"), pch = 16, cex=1, inset=c(0.02))
+
+plot3d_all
+rglwidget()
+```
+
+Taken individually both the BH and the NBH, they show the tendency to loosely divide into two groups.
+
+When the two populations are merged together, it is not possible to clearly distinguish the presence of distinct clusters in the cloud of points generated by bottleneck and non-bottleneck hubs.
+
+The only thing that can be highlighted is the fact that a small group of BH occupy, alone, the bottom right part of the 3D plot while in the other portions of the space, the proportion and the occupance, of the two populations is almost the same.
+
+# 6.Conclusion
+
+In this project, we identified, based on the topological features of degree and betweenness, bottleneck hubs (BH), non-bottleneck hubs (NBH), bottleneck non-hubs (BNH) and non-bottleneck non-hubs (NBNH) and we integrated these categories with the concept of party and date hubs using a filtered high-confidence PPI network and a E.Coli gene expression compendium.
+
+Among the 4 categories above, we focused mainly on bottleneck and non-bottleneck hubs and we estimated the Pearson Correlation Coefficient for each interactor of the two categories, with the aim of classifying hubs on the basis of the PCC levels.
+By "manually" setting a separation boundary from the PCC plot, we were able to distinguish party and date hubs both inside BH and NBH and we performed also a statistical test in order to establish the significance of the relationship between the party/date hubs and the corresponding class to which they are associated.
+
+Also the usage of heatmaps and the application of the dimensionality reduction technique partially confirmed the presence of both party and date hubs in BH and NBH.
+
+Some results of this analysis are in contrast with what Han et al. and Haiyaun et al. found; in particular we were not able to prove that the average PCCs of hubs follow a bimodal distribution in the compendium of E.Coli and we cannot establish a full correspondence between date and BH and between party and NBH because even if in the BH the vast majority of hubs were classified as date, in NBH we have almost the same number of party and date hubs.
+The usage of datasets of different organisms (yeast vs bacterium) could cause these discrepancies especially regarding the bimodality of the data which, as [Agarwal et al.](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC2887459/) states, is a feature that is not always robust to methodological changes. 
+
+Future analysis may take into account the possibility of integrating this work with what has been done in literature in related studies.
+For example, having an available E.Coli essential list of genes to use as a reference, can allow to checking if bottlenecks have a much higher tendency to be essential genes as found by Huiyuan et al. or, focusing on hubs, it could be interesting also to investigate how they might contribute to robustness and other cellular properties in PPI network as done by Han et al. with yeast interactome.
+
+
+# 7.References
+
+-   The Importance of Bottlenecks in Protein Networks: Correlation with Gene Essentiality and Expression Dynamics(https://www.ncbi.nlm.nih.gov/pmc/articles/PMC1853125/)
+
+-   Evidence for dynamically organized modularity in the yeast protein–protein interaction network(https://www.nature.com/articles/nature02555)
+
+
+-   RCy3: Network biology using Cytoscape from within R (https://www.ncbi.nlm.nih.gov/pmc/articles/PMC6880260/)
+
+
+
+-   Package 'multimode' (https://cran.r-project.org/web/packages/multimode/multimode.pdf)
+
+
+-   The Use of Edge-Betweenness Clustering to Investigate Biological Function in Protein Interaction Networks (https://bmcbioinformatics.biomedcentral.com/articles/10.1186/1471-2105-6-39)
+
+
+-  Statistical notes for clinical researchers: Chi-squared test and Fisher's exact test (https://www.ncbi.nlm.nih.gov/pmc/articles/PMC5426219/)
+
+
+-   Revisiting Date and Party Hubs: Novel Approaches to Role Assignment in Protein Interaction Networks (https://www.ncbi.nlm.nih.gov/pmc/articles/PMC2887459/)
+
+
+
+```{r}
+sessionInfo()
+```
